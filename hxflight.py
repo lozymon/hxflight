@@ -2,8 +2,8 @@
 """HyperX Cloud Flight control panel for Linux.
 
 Talks to the wireless dongle over hidraw (battery, charging, power and
-mic-mute state) and to PipeWire/PulseAudio through pactl (volumes and
-mic monitoring).
+mic-mute state); hxaudio handles volumes, routing and sound effects
+through PipeWire.
 """
 
 import argparse
@@ -11,12 +11,18 @@ import bisect
 import collections
 import glob
 import json
+import math
 import os
 import re
 import select
+import signal
+import struct
 import subprocess
 import sys
+import threading
 import time
+
+import hxaudio
 
 APP_ID = "hxflight"
 APP_NAME = "HyperX Cloud Flight"
@@ -42,6 +48,7 @@ VOLTAGES = [3328, 3584, 3674, 3704, 3732, 3744, 3754, 3764, 3774, 3784,
 CHARGING_MV = 0x1014
 
 POLL_SECONDS = 60
+OFF_POLL_SECONDS = 10  # while the headset is switched off
 REPLY_TIMEOUT = 3
 RETRY_SECONDS = 3
 SMOOTH_SAMPLES = 10  # battery readings averaged, one per poll
@@ -54,7 +61,29 @@ ICON_DIR = os.path.join(
     os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), APP_ID)
 ICON_SIZE = 64
 MAX_VOLUME = 150
-DEFAULT_CONFIG = {"low_battery": 20, "notify_mute": True, "monitor_latency": 20}
+DATA_DIR = os.path.join(
+    os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
+    APP_ID)
+HISTORY_HOURS = 12
+RATED_HOURS = 30  # battery life the manufacturer quotes
+MIC_TEST_SECONDS = 5
+DEFAULT_CONFIG = {
+    "low_battery": 20,
+    "notify_mute": True,
+    "monitor_latency": 20,
+    "sync_mute": True,
+    "auto_switch": True,
+    "pause_on_off": True,
+    "fallback": {},  # output/microphone to return to when the headset is off
+    "eq_enabled": False,
+    "eq_preset": "Flat",
+    "eq_gains": [0.0] * len(hxaudio.EQ_FREQS),
+    "eq_presets": {},
+    "surround": False,
+    "noise_suppression": False,
+    "noise_mode": "standard",  # or "voice"
+    "voice_threshold": 60,
+}
 
 
 def find_hidraw():
@@ -80,6 +109,78 @@ def voltage_to_percent(mv):
     return (max(bisect.bisect_right(VOLTAGES, mv) - 1, 0) + 1) * 5
 
 
+def voltage_to_fraction(mv):
+    """Like voltage_to_percent but interpolated, for graphs and estimates."""
+    i = bisect.bisect_right(VOLTAGES, mv) - 1
+    if i < 0:
+        return 0.0
+    if i >= len(VOLTAGES) - 1:
+        return 100.0
+    return 5.0 * (i + 1 + (mv - VOLTAGES[i]) / (VOLTAGES[i + 1] - VOLTAGES[i]))
+
+
+class History:
+    """Battery voltage readings over time, kept across restarts."""
+
+    GAP = 300  # seconds without a reading that separate two runs
+    KEEP = 48 * 3600
+
+    def __init__(self):
+        self.path = os.path.join(DATA_DIR, "battery.csv")
+        self.points = []
+        cutoff = time.time() - self.KEEP
+        try:
+            with open(self.path) as f:
+                for line in f:
+                    ts, mv = line.split(",")
+                    if float(ts) >= cutoff:
+                        self.points.append((float(ts), float(mv)))
+            with open(self.path, "w") as f:
+                f.writelines(f"{ts:.0f},{mv:.1f}\n" for ts, mv in self.points)
+        except (OSError, ValueError):
+            pass
+
+    def add(self, ts, mv):
+        self.points.append((ts, mv))
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(self.path, "a") as f:
+                f.write(f"{ts:.0f},{mv:.1f}\n")
+        except OSError:
+            pass
+
+    def runs(self, since):
+        """Readings newer than `since`, split where the headset was off."""
+        runs = []
+        for point in self.points:
+            if point[0] < since:
+                continue
+            if runs and point[0] - runs[-1][-1][0] <= self.GAP:
+                runs[-1].append(point)
+            else:
+                runs.append([point])
+        return runs
+
+    def hours_left(self):
+        """Return (hours, measured). `measured` is False when there is too
+        little data and the figure comes from the rated battery life."""
+        now = time.time()
+        runs = self.runs(now - 2 * 3600)
+        if not runs or now - runs[-1][-1][0] > self.GAP:
+            return None, False
+        run = runs[-1]
+        level = voltage_to_fraction(run[-1][1])
+        if run[-1][0] - run[0][0] >= 1800:
+            xs = [(ts - run[0][0]) / 3600 for ts, _mv in run]
+            ys = [voltage_to_fraction(mv) for _ts, mv in run]
+            mean_x, mean_y = sum(xs) / len(xs), sum(ys) / len(ys)
+            slope = (sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+                     / sum((x - mean_x) ** 2 for x in xs))
+            if slope <= -1:  # percent per hour
+                return min(level / -slope, RATED_HOURS), True
+        return level / 100 * RATED_HOURS, False
+
+
 def parse_report(data):
     """Decode one input report into a dict of state changes."""
     if len(data) < 2:
@@ -101,64 +202,6 @@ def parse_report(data):
         return {"power": True, "charging": False, "voltage": mv,
                 "battery": voltage_to_percent(mv)}
     return {}
-
-
-def pactl(*args):
-    try:
-        return subprocess.run(["pactl", *args], capture_output=True, text=True,
-                              timeout=3).stdout
-    except (OSError, subprocess.SubprocessError):
-        return ""
-
-
-class Audio:
-    """Headset sink/source volume control through pactl."""
-
-    def __init__(self):
-        self.loopback = None
-
-    def _find(self, kind):
-        for line in pactl("list", "short", kind + "s").splitlines():
-            cols = line.split("\t")
-            if (len(cols) > 1 and "HyperX" in cols[1]
-                    and not cols[1].endswith(".monitor")):
-                return cols[1]
-        return None
-
-    def get(self, kind):
-        """Return (volume percent, muted) or None when the device is absent."""
-        name = self._find(kind)
-        if not name:
-            return None
-        m = re.search(r"(\d+)%", pactl(f"get-{kind}-volume", name))
-        if not m:
-            return None
-        return int(m.group(1)), "yes" in pactl(f"get-{kind}-mute", name)
-
-    def set_volume(self, kind, percent):
-        name = self._find(kind)
-        if name:
-            pactl(f"set-{kind}-volume", name, f"{int(percent)}%")
-
-    def set_mute(self, kind, muted):
-        name = self._find(kind)
-        if name:
-            pactl(f"set-{kind}-mute", name, "1" if muted else "0")
-
-    def set_monitoring(self, enabled, latency):
-        """Route the headset mic back into the headset (software sidetone)."""
-        if self.loopback:
-            pactl("unload-module", self.loopback)
-            self.loopback = None
-        if not enabled:
-            return True
-        source, sink = self._find("source"), self._find("sink")
-        if not (source and sink):
-            return False
-        out = pactl("load-module", "module-loopback", f"source={source}",
-                    f"sink={sink}", f"latency_msec={int(latency)}").strip()
-        self.loopback = out if out.isdigit() else None
-        return self.loopback is not None
 
 
 def load_config():
@@ -269,11 +312,15 @@ def gui():
     from gi.repository import AyatanaAppIndicator3 as AppIndicator
     from gi.repository import Gio, GLib, Gtk, Notify
 
+    MIC_PAGE = 2
+    CUSTOM = "Custom"
+
     class App(Gtk.Application):
         def __init__(self):
             super().__init__(application_id="io.github.hxflight")
             self.config = load_config()
-            self.audio = Audio()
+            self.audio = hxaudio.Audio()
+            self.history = History()
             self.fd = None
             self.watch = None
             self.error = None
@@ -283,9 +330,20 @@ def gui():
             self.charging = False
             self.muted = None
             self.pending_since = None
+            self.misses = 0
+            self.last_request = 0
             self.warned_low = False
             self.window = None
             self.syncing = False
+            self.headset_present = None
+            self.eq_timer = None
+            self.noise_timer = None
+            self.downloading = False
+            self.events = None
+            self.sync_timer = None
+            self.meter = None
+            self.meter_watch = None
+            self.test_process = None
 
         # --- device -----------------------------------------------------
 
@@ -306,26 +364,47 @@ def gui():
             if self.fd is not None:
                 os.close(self.fd)
             self.fd = self.watch = self.pending_since = None
-            self.power = self.battery = self.muted = None
-            self.charging = False
-            self.samples.clear()
+            self.misses = 0
+            self.set_power(None)
             self.refresh()
+
+        def poll(self):
+            """Runs every few seconds; asks more often while the headset is
+            off so switching it on is noticed quickly."""
+            interval = OFF_POLL_SECONDS if self.power is False else POLL_SECONDS
+            if time.time() - self.last_request >= interval:
+                self.request_battery()
+            return True
 
         def request_battery(self):
             if self.fd is None:
-                return True
-            if (self.pending_since
-                    and time.time() - self.pending_since > REPLY_TIMEOUT):
-                # dongle is present but the headset did not answer
-                self.power, self.battery, self.charging = False, None, False
-                self.samples.clear()
-                self.refresh()
+                return
             try:
                 os.write(self.fd, battery_request())
-                self.pending_since = self.pending_since or time.time()
             except OSError:
                 self.disconnect_device()
-            return True
+                return
+            self.last_request = time.time()
+            if self.pending_since is None:
+                self.pending_since = self.last_request
+                GLib.timeout_add_seconds(REPLY_TIMEOUT, self.check_reply)
+
+        def check_reply(self):
+            """A request went unanswered: retry once, then treat the headset
+            as switched off."""
+            if self.fd is None or self.pending_since is None:
+                return False
+            if time.time() - self.pending_since < REPLY_TIMEOUT - 0.5:
+                return False  # a newer request has its own check scheduled
+            self.pending_since = None
+            self.misses += 1
+            if self.misses >= 2:
+                if self.power is not False:
+                    self.set_power(False)
+                    self.refresh()
+            else:
+                self.request_battery()
+            return False
 
         def on_readable(self, fd, condition):
             if condition & (GLib.IO_HUP | GLib.IO_ERR):
@@ -343,34 +422,77 @@ def gui():
             self.apply(parse_report(data))
             return True
 
+        def set_power(self, value):
+            was, self.power = self.power, value
+            if not value:
+                self.battery, self.charging, self.muted = None, False, None
+                self.samples.clear()
+            if value and was is False:
+                self.on_headset_on()
+            elif value is False and was:
+                self.on_headset_off()
+
+        def on_headset_on(self):
+            if self.config["auto_switch"]:
+                replaced = self.audio.switch_to_headset()
+                if replaced:
+                    self.config["fallback"].update(replaced)
+                    save_config(self.config)
+
+        def on_headset_off(self):
+            if self.config["pause_on_off"]:
+                self.pause_media()
+            if self.config["auto_switch"]:
+                self.audio.switch_away(self.config["fallback"])
+
+        def pause_media(self):
+            """Pause every MPRIS media player on the session bus."""
+            try:
+                bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+                names = bus.call_sync(
+                    "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                    "org.freedesktop.DBus", "ListNames", None,
+                    GLib.VariantType("(as)"), Gio.DBusCallFlags.NONE, 1000,
+                    None).unpack()[0]
+                for name in names:
+                    if name.startswith("org.mpris.MediaPlayer2."):
+                        bus.call(name, "/org/mpris/MediaPlayer2",
+                                 "org.mpris.MediaPlayer2.Player", "Pause",
+                                 None, None, Gio.DBusCallFlags.NONE, 1000,
+                                 None, None, None)
+            except GLib.Error:
+                pass
+
         def apply(self, state):
             if not state:
                 return
             if "voltage" in state:
                 self.pending_since = None
+                self.misses = 0
                 self.charging = state["charging"]
                 if self.charging:
                     self.samples.clear()
                 else:
                     self.samples.append(state["voltage"])
-                    self.battery = voltage_to_percent(
-                        sum(self.samples) / len(self.samples))
+                    smoothed = sum(self.samples) / len(self.samples)
+                    self.battery = voltage_to_percent(smoothed)
+                    self.history.add(time.time(), smoothed)
             if "power" in state:
-                was = self.power
-                self.power = state["power"]
-                if not self.power:
-                    self.battery, self.charging, self.muted = None, False, None
-                    self.samples.clear()
-                elif was is False:
+                was_off = self.power is False
+                self.set_power(state["power"])
+                if state["power"] and was_off:
                     GLib.timeout_add_seconds(1, self.request_once)
             if "muted" in state:
-                self.power = True
+                if self.power is not True:
+                    self.set_power(True)
                 if state["muted"] != self.muted and self.config["notify_mute"]:
                     self.notify("Microphone muted" if state["muted"]
                                 else "Microphone on",
                                 "microphone-sensitivity-muted" if state["muted"]
                                 else "audio-input-microphone")
                 self.muted = state["muted"]
+                if self.config["sync_mute"]:
+                    self.audio.set_mute("source", self.muted, raw=True)
             low = self.config["low_battery"]
             if self.battery is not None and not self.charging:
                 if self.battery <= low and not self.warned_low:
@@ -406,6 +528,17 @@ def gui():
                 return "Connected"
             return f"Battery {self.battery}%"
 
+        def remaining_text(self):
+            if not self.power or self.charging or self.battery is None:
+                return ""
+            hours, measured = self.history.hours_left()
+            if hours is None:
+                return ""
+            amount = (f"{hours:.0f} hours" if hours >= 2
+                      else f"{max(hours * 60, 5):.0f} minutes")
+            basis = "at the current drain" if measured else "at typical use"
+            return f"About {amount} left {basis}"
+
         def icon_name(self):
             if self.fd is None or not self.power:
                 return "audio-headset"
@@ -423,19 +556,85 @@ def gui():
 
         def refresh(self):
             status = self.status_text()
+            remaining = self.remaining_text()
             self.indicator.set_icon_full(self.icon_name(), status)
             self.indicator.set_title(f"{APP_NAME} - {status}")
             self.menu_status.set_label(status)
+            self.menu_remaining.set_label(remaining)
+            self.menu_remaining.set_visible(bool(remaining))
             self.menu_mic.set_label(self.mic_text())
             if self.window:
                 self.status_label.set_text(status)
+                self.remaining_label.set_text(remaining)
                 self.mic_label.set_text(self.mic_text())
                 self.level.set_value(self.battery or 0)
                 self.level.set_sensitive(self.battery is not None)
+                self.graph.queue_draw()
+
+        def draw_history(self, area, cr):
+            width = area.get_allocated_width()
+            height = area.get_allocated_height()
+            color = area.get_style_context().get_color(Gtk.StateFlags.NORMAL)
+            cr.set_line_width(1)
+            cr.set_source_rgba(color.red, color.green, color.blue, 0.15)
+            for step in range(5):
+                y = round(height * step / 4) + 0.5
+                cr.move_to(0, min(y, height - 0.5))
+                cr.line_to(width, min(y, height - 0.5))
+            cr.stroke()
+            cr.set_source_rgba(0.18, 0.62, 0.30, 1)
+            cr.set_line_width(2)
+            now = time.time()
+            for run in self.history.runs(now - HISTORY_HOURS * 3600):
+                for i, (ts, mv) in enumerate(run):
+                    x = width * (1 - (now - ts) / (HISTORY_HOURS * 3600))
+                    y = height * (1 - voltage_to_fraction(mv) / 100)
+                    (cr.line_to if i else cr.move_to)(x, y)
+                if len(run) == 1:
+                    cr.rel_line_to(2, 0)
+                cr.stroke()
+
+        def tick(self):
+            """Follow the headset's audio devices appearing or vanishing and
+            keep the sliders in step with the system."""
+            present = self.audio.present()
+            if present != self.headset_present:
+                self.headset_present = present
+                self.apply_effects()
+            self.sync_audio()
+            return True
+
+        def watch_audio(self):
+            """Follow volume changes made outside the app as they happen."""
+            self.events = subprocess.Popen(
+                ["pactl", "subscribe"], stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, preexec_fn=hxaudio._die_with_parent)
+            fd = self.events.stdout.fileno()
+            os.set_blocking(fd, False)
+            GLib.io_add_watch(fd, GLib.IO_IN | GLib.IO_HUP, self.on_audio_event)
+
+        def on_audio_event(self, fd, condition):
+            try:
+                data = os.read(fd, 65536)
+            except BlockingIOError:
+                return True
+            except OSError:
+                data = b""
+            if not data:
+                return False
+            if ((b"on sink #" in data or b"on source #" in data
+                 or b"on server" in data) and self.sync_timer is None):
+                self.sync_timer = GLib.timeout_add(100, self.sync_soon)
+            return True
+
+        def sync_soon(self):
+            self.sync_timer = None
+            self.sync_audio()
+            return False
 
         def sync_audio(self):
             if not (self.window and self.window.get_visible()):
-                return True
+                return
             self.syncing = True
             for kind, scale, mute in (("sink", self.out_scale, self.out_mute),
                                       ("source", self.mic_scale, self.mic_mute)):
@@ -446,7 +645,252 @@ def gui():
                     scale.set_value(state[0])
                     mute.set_active(state[1])
             self.syncing = False
+
+        # --- effects ----------------------------------------------------
+
+        def apply_effects(self):
+            running = self.audio.apply_effects(self.config)
+            self.audio.reroute()
+            if self.audio.loopback:
+                # the microphone it was listening to may have been replaced
+                self.audio.set_monitoring(True, self.config["monitor_latency"])
+            return running
+
+        def on_effect(self, switch, _param, key, name):
+            if self.syncing:
+                return
+            self.config[key] = switch.get_active()
+            running = self.apply_effects()
+            if switch.get_active() and not running[name]:
+                self.config[key] = False
+                self.syncing = True
+                switch.set_active(False)
+                self.syncing = False
+                self.notify("Could not start this effect - is the headset "
+                            "dongle plugged in?", "dialog-warning")
+            save_config(self.config)
+            self.eq_box.set_sensitive(self.config["eq_enabled"])
+            if name == "noise":
+                self.update_meter(restart=True)
+                self.need_voice_plugin()
+
+        def need_voice_plugin(self):
+            """Fetch the voice filter the first time voice-only mode is used.
+            Returns True when a download was started."""
+            if (self.downloading or not self.config["noise_suppression"]
+                    or self.config["noise_mode"] != "voice"
+                    or os.path.exists(hxaudio.VOICE_PLUGIN)):
+                return False
+            self.downloading = True
+            self.noise_status.set_text(
+                "Downloading the voice filter (37 MB). Standard suppression "
+                "is used until it is ready.")
+
+            def work():
+                try:
+                    hxaudio.install_voice_plugin()
+                    error = None
+                except (OSError, KeyError, ValueError) as e:
+                    error = str(e)
+                GLib.idle_add(done, error)
+
+            def done(error):
+                self.downloading = False
+                self.noise_status.set_text(
+                    f"Could not get the voice filter: {error}" if error else "")
+                self.restart_noise()
+                return False
+
+            threading.Thread(target=work, daemon=True).start()
             return True
+
+        def restart_noise(self):
+            self.noise_timer = None
+            save_config(self.config)
+            self.apply_effects()
+            self.update_meter(restart=True)
+            return False
+
+        def on_noise_mode(self, combo):
+            if self.syncing:
+                return
+            self.config["noise_mode"] = combo.get_active_id()
+            self.threshold_scale.set_sensitive(
+                self.config["noise_mode"] == "voice")
+            if not self.need_voice_plugin():
+                self.restart_noise()
+
+        def on_threshold(self, scale):
+            self.config["voice_threshold"] = int(scale.get_value())
+            if self.noise_timer is None:
+                self.noise_timer = GLib.timeout_add(600, self.restart_noise)
+
+        def presets(self):
+            return {**hxaudio.EQ_PRESETS, **self.config["eq_presets"]}
+
+        def fill_presets(self):
+            self.syncing = True
+            self.preset_combo.remove_all()
+            for name in list(self.presets()) + [CUSTOM]:
+                self.preset_combo.append(name, name)
+            current = self.config["eq_preset"]
+            if current not in self.presets():
+                current = CUSTOM
+            self.preset_combo.set_active_id(current)
+            self.delete_button.set_sensitive(
+                current in self.config["eq_presets"])
+            self.syncing = False
+
+        def on_preset(self, combo):
+            name = combo.get_active_id()
+            if self.syncing or name is None or name == CUSTOM:
+                return
+            self.config["eq_preset"] = name
+            self.config["eq_gains"] = list(self.presets()[name])
+            self.syncing = True
+            for scale, gain in zip(self.eq_scales, self.config["eq_gains"]):
+                scale.set_value(gain)
+            self.syncing = False
+            self.delete_button.set_sensitive(name in self.config["eq_presets"])
+            self.push_eq()
+
+        def on_band(self, scale, band):
+            if self.syncing:
+                return
+            self.config["eq_gains"][band] = scale.get_value()
+            self.config["eq_preset"] = CUSTOM
+            self.syncing = True
+            self.preset_combo.set_active_id(CUSTOM)
+            self.syncing = False
+            self.delete_button.set_sensitive(False)
+            if self.eq_timer is None:
+                self.eq_timer = GLib.timeout_add(150, self.push_eq)
+
+        def push_eq(self):
+            self.eq_timer = None
+            self.audio.set_eq_gains(self.config["eq_gains"])
+            save_config(self.config)
+            return False
+
+        def on_save_preset(self, _button):
+            dialog = Gtk.Dialog(title="Save preset", transient_for=self.window,
+                                modal=True)
+            dialog.add_buttons("Cancel", Gtk.ResponseType.CANCEL,
+                               "Save", Gtk.ResponseType.OK)
+            dialog.set_default_response(Gtk.ResponseType.OK)
+            entry = Gtk.Entry(placeholder_text="Preset name", margin=12,
+                              activates_default=True)
+            dialog.get_content_area().add(entry)
+            dialog.show_all()
+            response = dialog.run()
+            name = entry.get_text().strip()
+            dialog.destroy()
+            if (response != Gtk.ResponseType.OK or not name or name == CUSTOM
+                    or name in hxaudio.EQ_PRESETS):
+                return
+            self.config["eq_presets"][name] = list(self.config["eq_gains"])
+            self.config["eq_preset"] = name
+            save_config(self.config)
+            self.fill_presets()
+
+        def on_delete_preset(self, _button):
+            self.config["eq_presets"].pop(self.config["eq_preset"], None)
+            self.config["eq_preset"] = CUSTOM
+            save_config(self.config)
+            self.fill_presets()
+
+        # --- microphone -------------------------------------------------
+
+        def update_meter(self, *_args, restart=False):
+            wanted = (self.window.get_visible()
+                      and self.notebook.get_current_page() == MIC_PAGE)
+            if self.meter and (restart or not wanted):
+                if self.meter_watch:
+                    GLib.source_remove(self.meter_watch)
+                self.meter.kill()
+                self.meter.wait()
+                self.meter = self.meter_watch = None
+                self.mic_level.set_value(0)
+            source = self.audio.preferred("source")
+            if wanted and not self.meter and source:
+                self.meter = subprocess.Popen(
+                    ["parec", "--device=" + source, "--format=s16le",
+                     "--rate=8000", "--channels=1", "--latency-msec=40",
+                     "--raw"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                fd = self.meter.stdout.fileno()
+                os.set_blocking(fd, False)
+                self.meter_watch = GLib.io_add_watch(
+                    fd, GLib.IO_IN | GLib.IO_HUP, self.on_meter)
+
+        def on_page(self, _notebook, _page, _number):
+            GLib.idle_add(self.update_meter)
+
+        def on_meter(self, fd, condition):
+            try:
+                data = os.read(fd, 65536)
+            except BlockingIOError:
+                return True
+            except OSError:
+                data = b""
+            if not data:
+                self.meter_watch = None
+                return False
+            count = len(data) // 2
+            if count:
+                peak = max(map(abs, struct.unpack(f"<{count}h",
+                                                  data[:count * 2])))
+                decibel = 20 * math.log10(max(peak / 32768, 1e-5))
+                level = max(0.0, min(1.0, 1 + decibel / 50))
+                self.mic_level.set_value(
+                    max(level, self.mic_level.get_value() * 0.8))
+            return True
+
+        def on_mic_test(self, button):
+            source = self.audio.preferred("source")
+            sink = self.audio.preferred("sink")
+            if self.test_process or not (source and sink):
+                return
+            path = os.path.join(hxaudio.CACHE_DIR, "mic-test.wav")
+            os.makedirs(hxaudio.CACHE_DIR, exist_ok=True)
+            self.test_process = subprocess.Popen(
+                ["pw-record", "--target", source, path],
+                stderr=subprocess.DEVNULL)
+            button.set_sensitive(False)
+            button.set_label(f"Recording {MIC_TEST_SECONDS} seconds...")
+
+            def finish():
+                if self.test_process.poll() is None:
+                    return True
+                self.test_process = None
+                button.set_label(self.test_label)
+                button.set_sensitive(True)
+                return False
+
+            def play():
+                # pw-record only finishes the file on SIGINT
+                self.test_process.send_signal(signal.SIGINT)
+                self.test_process.wait()
+                button.set_label("Playing back...")
+                self.test_process = subprocess.Popen(
+                    ["paplay", "--device=" + sink, path],
+                    stderr=subprocess.DEVNULL)
+                GLib.timeout_add(200, finish)
+                return False
+
+            GLib.timeout_add_seconds(MIC_TEST_SECONDS, play)
+
+        def on_monitoring(self, switch, _param):
+            if self.syncing:
+                return
+            ok = self.audio.set_monitoring(switch.get_active(),
+                                           self.config["monitor_latency"])
+            if switch.get_active() and not ok:
+                self.syncing = True
+                switch.set_active(False)
+                self.syncing = False
+
+        # --- window -----------------------------------------------------
 
         def volume_row(self, grid, row, title, kind):
             label = Gtk.Label(label=title, xalign=0)
@@ -472,76 +916,198 @@ def gui():
             grid.attach(mute, 2, row, 1, 1)
             return scale, mute
 
-        def switch_row(self, grid, row, title, active, handler):
-            label = Gtk.Label(label=title, xalign=0)
-            switch = Gtk.Switch(active=active, halign=Gtk.Align.END)
-            switch.connect("notify::active", handler)
-            grid.attach(label, 0, row, 2, 1)
+        def switch_row(self, grid, row, title, active, handler, *args,
+                       hint=None):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            box.add(Gtk.Label(label=title, xalign=0))
+            if hint:
+                box.add(self.hint(hint))
+            switch = Gtk.Switch(active=active, halign=Gtk.Align.END,
+                                valign=Gtk.Align.CENTER)
+            switch.connect("notify::active", handler, *args)
+            grid.attach(box, 0, row, 2, 1)
             grid.attach(switch, 2, row, 1, 1)
             return switch
+
+        def hint(self, text):
+            label = Gtk.Label(label=text, xalign=0, wrap=True,
+                              max_width_chars=52)
+            label.get_style_context().add_class("dim-label")
+            return label
+
+        def page(self, title):
+            grid = Gtk.Grid(row_spacing=12, column_spacing=12, margin=18)
+            self.notebook.append_page(grid, Gtk.Label(label=title))
+            return grid
+
+        def config_switch(self, grid, row, title, key, hint=None):
+            def on_toggle(switch, _param):
+                self.config[key] = switch.get_active()
+                save_config(self.config)
+            return self.switch_row(grid, row, title, self.config[key],
+                                   on_toggle, hint=hint)
 
         def build_window(self):
             self.window = Gtk.ApplicationWindow(application=self, title=APP_NAME)
             self.window.set_icon_name("audio-headset")
-            self.window.set_default_size(460, -1)
-            self.window.connect("delete-event",
-                                lambda w, e: w.hide() or True)
+            self.window.set_default_size(520, -1)
+            self.window.connect("delete-event", lambda w, e: w.hide() or True)
+            self.window.connect("show", self.update_meter)
+            self.window.connect("hide", self.update_meter)
+            self.notebook = Gtk.Notebook()
+            self.window.add(self.notebook)
 
-            grid = Gtk.Grid(row_spacing=12, column_spacing=12, margin=18)
-            self.window.add(grid)
-
+            # Status
+            grid = self.page("Status")
             self.status_label = Gtk.Label(xalign=0)
-            self.status_label.get_style_context().add_class("title-2")
-            self.level = Gtk.LevelBar(min_value=0, max_value=100)
+            self.level = Gtk.LevelBar(min_value=0, max_value=100, hexpand=True)
+            self.remaining_label = self.hint("")
             self.mic_label = Gtk.Label(xalign=0)
+            self.graph = Gtk.DrawingArea(hexpand=True)
+            self.graph.set_size_request(-1, 110)
+            self.graph.connect("draw", self.draw_history)
             grid.attach(self.status_label, 0, 0, 3, 1)
             grid.attach(self.level, 0, 1, 3, 1)
-            grid.attach(self.mic_label, 0, 2, 3, 1)
-            grid.attach(Gtk.Separator(), 0, 3, 3, 1)
+            grid.attach(self.remaining_label, 0, 2, 3, 1)
+            grid.attach(self.mic_label, 0, 3, 3, 1)
+            grid.attach(Gtk.Separator(), 0, 4, 3, 1)
+            grid.attach(Gtk.Label(
+                label=f"Battery over the last {HISTORY_HOURS} hours",
+                xalign=0), 0, 5, 3, 1)
+            grid.attach(self.graph, 0, 6, 3, 1)
 
+            # Sound
+            grid = self.page("Sound")
             self.out_scale, self.out_mute = self.volume_row(
-                grid, 4, "Headphone volume", "sink")
-            self.mic_scale, self.mic_mute = self.volume_row(
-                grid, 5, "Microphone volume", "source")
-            self.switch_row(grid, 6, "Mic monitoring (hear yourself)",
-                            False, self.on_monitoring)
-            grid.attach(Gtk.Separator(), 0, 7, 3, 1)
+                grid, 0, "Headphone volume", "sink")
+            grid.attach(Gtk.Separator(), 0, 1, 3, 1)
+            self.switch_row(grid, 2, "Equalizer", self.config["eq_enabled"],
+                            self.on_effect, "eq_enabled", "eq")
+            self.eq_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                                  spacing=8)
+            self.eq_box.set_sensitive(self.config["eq_enabled"])
+            presets = Gtk.Box(spacing=8)
+            self.preset_combo = Gtk.ComboBoxText(hexpand=True)
+            self.preset_combo.connect("changed", self.on_preset)
+            save_button = Gtk.Button(label="Save as...")
+            save_button.connect("clicked", self.on_save_preset)
+            self.delete_button = Gtk.Button(label="Delete")
+            self.delete_button.connect("clicked", self.on_delete_preset)
+            for widget in (Gtk.Label(label="Preset"), self.preset_combo,
+                           save_button, self.delete_button):
+                presets.add(widget)
+            bands = Gtk.Box(spacing=4, homogeneous=True)
+            self.eq_scales = []
+            for band, freq in enumerate(hxaudio.EQ_FREQS):
+                column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+                scale = Gtk.Scale.new_with_range(
+                    Gtk.Orientation.VERTICAL, -hxaudio.EQ_RANGE,
+                    hxaudio.EQ_RANGE, 1)
+                scale.set_inverted(True)
+                scale.set_size_request(-1, 150)
+                scale.add_mark(0, Gtk.PositionType.LEFT, None)
+                scale.set_value(self.config["eq_gains"][band])
+                scale.connect("value-changed", self.on_band, band)
+                name = f"{freq // 1000}k" if freq >= 1000 else str(freq)
+                column.add(scale)
+                column.add(Gtk.Label(label=name))
+                bands.add(column)
+                self.eq_scales.append(scale)
+            self.eq_box.add(presets)
+            self.eq_box.add(bands)
+            self.eq_box.add(self.hint(
+                "Gain in dB per frequency band. Boosting a band lowers the "
+                "overall level a little so the sound does not distort."))
+            grid.attach(self.eq_box, 0, 3, 3, 1)
+            self.fill_presets()
+            grid.attach(Gtk.Separator(), 0, 4, 3, 1)
+            self.switch_row(
+                grid, 5, "Virtual surround 7.1", self.config["surround"],
+                self.on_effect, "surround", "surround",
+                hint="Set the game or player to 7.1 output. Stereo music "
+                     "sounds wider but less direct with this on.")
 
-            grid.attach(Gtk.Label(label="Low battery warning at", xalign=0),
-                        0, 8, 2, 1)
+            # Microphone
+            grid = self.page("Microphone")
+            self.mic_scale, self.mic_mute = self.volume_row(
+                grid, 0, "Microphone volume", "source")
+            grid.attach(Gtk.Label(label="Input level", xalign=0), 0, 1, 1, 1)
+            self.mic_level = Gtk.LevelBar(min_value=0, max_value=1,
+                                          hexpand=True, valign=Gtk.Align.CENTER)
+            grid.attach(self.mic_level, 1, 1, 2, 1)
+            self.test_label = f"Record {MIC_TEST_SECONDS} seconds and play back"
+            test = Gtk.Button(label=self.test_label)
+            test.connect("clicked", self.on_mic_test)
+            grid.attach(test, 0, 2, 3, 1)
+            grid.attach(Gtk.Separator(), 0, 3, 3, 1)
+            self.switch_row(
+                grid, 4, "Noise suppression",
+                self.config["noise_suppression"], self.on_effect,
+                "noise_suppression", "noise",
+                hint="Adds a second, filtered HyperX microphone for apps "
+                     "to use.")
+            grid.attach(Gtk.Label(label="Mode", xalign=0), 0, 5, 1, 1)
+            mode = Gtk.ComboBoxText(hexpand=True)
+            mode.append("standard", "Standard - reduces steady background noise")
+            mode.append("voice", "Voice only - silences everything but speech")
+            mode.set_active_id(self.config["noise_mode"])
+            mode.connect("changed", self.on_noise_mode)
+            grid.attach(mode, 1, 5, 2, 1)
+            grid.attach(Gtk.Label(label="Strictness", xalign=0), 0, 6, 1, 1)
+            self.threshold_scale = Gtk.Scale.new_with_range(
+                Gtk.Orientation.HORIZONTAL, 10, 95, 5)
+            self.threshold_scale.set_value(self.config["voice_threshold"])
+            self.threshold_scale.set_value_pos(Gtk.PositionType.RIGHT)
+            self.threshold_scale.set_sensitive(
+                self.config["noise_mode"] == "voice")
+            self.threshold_scale.connect("value-changed", self.on_threshold)
+            grid.attach(self.threshold_scale, 1, 6, 2, 1)
+            self.noise_status = self.hint("")
+            grid.attach(self.hint(
+                "Voice only: higher strictness blocks more, but can cut the "
+                "start of words. It passes any human voice, not just yours."),
+                0, 7, 3, 1)
+            grid.attach(self.noise_status, 0, 8, 3, 1)
+            grid.attach(Gtk.Separator(), 0, 9, 3, 1)
+            self.switch_row(grid, 10, "Mic monitoring (hear yourself)",
+                            False, self.on_monitoring)
+            self.config_switch(
+                grid, 11, "Mute button also mutes the system microphone",
+                "sync_mute",
+                hint="Apps then show you as muted when you press the "
+                     "headset's mute button.")
+            self.config_switch(grid, 12, "Notify when mic is muted/unmuted",
+                               "notify_mute")
+
+            # Settings
+            grid = self.page("Settings")
+            self.config_switch(
+                grid, 0, "Switch audio to the headset when it turns on",
+                "auto_switch",
+                hint="And back to the previous output and microphone when "
+                     "it turns off.")
+            self.config_switch(grid, 1, "Pause media when the headset turns off",
+                               "pause_on_off")
+            grid.attach(Gtk.Separator(), 0, 2, 3, 1)
+            grid.attach(Gtk.Label(label="Low battery warning at (%)", xalign=0,
+                                  hexpand=True), 0, 3, 2, 1)
             spin = Gtk.SpinButton.new_with_range(5, 50, 5)
             spin.set_value(self.config["low_battery"])
             spin.connect("value-changed", self.on_low_battery)
-            grid.attach(spin, 2, 8, 1, 1)
-            self.switch_row(grid, 9, "Notify when mic is muted/unmuted",
-                            self.config["notify_mute"], self.on_notify_mute)
-            self.switch_row(grid, 10, "Start on login",
+            grid.attach(spin, 2, 3, 1, 1)
+            self.switch_row(grid, 4, "Start on login",
                             os.path.exists(AUTOSTART_PATH), self.on_autostart)
-            grid.attach(Gtk.Separator(), 0, 11, 3, 1)
-            led = Gtk.Label(xalign=0, wrap=True, max_width_chars=50, label=(
+            grid.attach(Gtk.Separator(), 0, 5, 3, 1)
+            grid.attach(self.hint(
                 "Earcup LEDs: press the headset's power button briefly to "
                 "switch between solid, breathing and off. They are red only "
-                "and cannot be set from the computer."))
-            led.get_style_context().add_class("dim-label")
-            grid.attach(led, 0, 12, 3, 1)
-            grid.show_all()
+                "and cannot be set from the computer."), 0, 6, 3, 1)
 
-        def on_monitoring(self, switch, _param):
-            if self.syncing:
-                return
-            ok = self.audio.set_monitoring(switch.get_active(),
-                                           self.config["monitor_latency"])
-            if switch.get_active() and not ok:
-                self.syncing = True
-                switch.set_active(False)
-                self.syncing = False
+            self.notebook.connect("switch-page", self.on_page)
+            self.notebook.show_all()
 
         def on_low_battery(self, spin):
             self.config["low_battery"] = spin.get_value_as_int()
-            save_config(self.config)
-
-        def on_notify_mute(self, switch, _param):
-            self.config["notify_mute"] = switch.get_active()
             save_config(self.config)
 
         def on_autostart(self, switch, _param):
@@ -555,13 +1121,26 @@ def gui():
                 os.remove(AUTOSTART_PATH)
 
         def show_window(self, *_args):
-            self.sync_audio()
             self.window.present()
             self.sync_audio()
 
         def quit_app(self, *_args):
+            for process in (self.meter, self.events):
+                if process:
+                    process.kill()
             self.audio.set_monitoring(False, 0)
+            # leave the default on a device that still exists once the
+            # effect processes are gone
+            for kind in ("sink", "source"):
+                raw = self.audio._find(kind)
+                current = self.audio.default(kind)
+                if raw and current in self.audio.family(kind) - {raw}:
+                    if kind == "sink":
+                        self.audio._carry_volume(current, raw)
+                    self.audio.set_default(kind, raw)
+            self.audio.stop_effects()
             self.quit()
+            return False
 
         # --- lifecycle --------------------------------------------------
 
@@ -571,12 +1150,13 @@ def gui():
 
             menu = Gtk.Menu()
             self.menu_status = Gtk.MenuItem(label="", sensitive=False)
+            self.menu_remaining = Gtk.MenuItem(label="", sensitive=False)
             self.menu_mic = Gtk.MenuItem(label="", sensitive=False)
             open_item = Gtk.MenuItem(label="Open")
             open_item.connect("activate", self.show_window)
             quit_item = Gtk.MenuItem(label="Quit")
             quit_item.connect("activate", self.quit_app)
-            for item in (self.menu_status, self.menu_mic,
+            for item in (self.menu_status, self.menu_remaining, self.menu_mic,
                          Gtk.SeparatorMenuItem(), open_item, quit_item):
                 menu.append(item)
             menu.show_all()
@@ -590,9 +1170,14 @@ def gui():
 
             self.build_window()
             self.connect_device()
+            self.tick()
+            self.watch_audio()
             GLib.timeout_add_seconds(RETRY_SECONDS, self.connect_device)
-            GLib.timeout_add_seconds(POLL_SECONDS, self.request_battery)
-            GLib.timeout_add_seconds(2, self.sync_audio)
+            GLib.timeout_add_seconds(OFF_POLL_SECONDS, self.poll)
+            GLib.timeout_add_seconds(3, self.tick)
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signum,
+                                     self.quit_app)
             self.hold()
 
         def do_activate(self):
