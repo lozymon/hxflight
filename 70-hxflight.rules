@@ -1,0 +1,6 @@
+# Let the logged-in user talk to the HyperX Cloud Flight wireless dongle
+KERNEL=="hidraw*", ATTRS{idVendor}=="03f0", ATTRS{idProduct}=="0c8c", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="03f0", ATTRS{idProduct}=="0e90", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="0951", ATTRS{idProduct}=="1749", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="0951", ATTRS{idProduct}=="16c4", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="0951", ATTRS{idProduct}=="1723", TAG+="uaccess"
